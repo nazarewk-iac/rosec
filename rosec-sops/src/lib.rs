@@ -22,15 +22,16 @@
 //! label: github.com
 //! attributes:
 //!   rosec:type: login
-//!   username: kdn
+//!   username: user
 //! secrets:
 //!   password: hunter2
 //! binary_secrets:          # only when a value is not UTF-8, standard base64
 //!   blob: AP+AQQ==
 //! created: 2026-11-14T18:02:11.000000000Z
 //! modified: 2026-11-14T18:41:09.417000000Z
-//! host: oams
+//! host: host-a
 //! revision: 7
+//! version: 1
 //! ```
 //!
 //! `created` and `modified` are RFC 3339 on write; a bare Unix epoch is
@@ -154,7 +155,7 @@
 //! [[provider]]
 //! id   = "sops"
 //! kind = "sops"
-//! path = "~/Nextcloud/drag0nius@nc.nazarewk.pw/important/rosec-storage"
+//! path = "~/Nextcloud/rosec-store"
 //!
 //! [provider.options]
 //! key_file      = "~/.config/sops/age/keys.txt"   # default
@@ -178,14 +179,25 @@ pub mod config;
 pub mod conflicts;
 pub mod document;
 pub mod error;
+pub mod identity;
+pub mod identity_cli;
 pub mod provider;
 pub mod sops;
 pub mod store;
+pub mod store_migrate;
+pub mod store_mode;
 
-pub use config::{DEFAULT_KEY_FILE, DEFAULT_SOPS_BINARY, SopsConfig};
+pub use config::{
+    DEFAULT_KEY_FILE, DEFAULT_SOPS_BINARY, SopsConfig, default_runtime_identity_file,
+    store_identity_path, store_identity_recipient_path,
+};
 pub use conflicts::{CONFLICTS_DIR, ConflictMarker, CopyMeta, StoredMarker};
 pub use document::{CollectionMeta, SecretDecodeError, SopsDocument, Timestamp};
 pub use error::SopsError;
+pub use identity::{
+    IdentityPaths, MasterState, ensure_runtime_identity, master_path, read_sidecar, sidecar_path,
+    unwrap_master,
+};
 pub use provider::{
     ATTR_COLLECTION, ATTR_COLLECTION_DIR, ATTR_CONFLICT, ATTR_UNRESOLVED_CONFLICT,
     DEFAULT_COLLECTION, INTERNAL_ATTRIBUTES, SopsProvider, new_id,
@@ -195,6 +207,13 @@ pub use store::{
     COLLECTION_META, ITEM_SUFFIX, Keep, LEGACY_COLLECTION_META, Resolution, SUPERSEDED_PREFIX,
     SYNCTHING_CONFLICT_MARKER, Store, StoreCache, StoreItem,
 };
+pub use store_migrate::{MigrationReport, migrate_store};
+pub use store_mode::{
+    STORE_IDENTITY_FILE, STORE_IDENTITY_RECIPIENT_FILE, STORE_META_FILE, StoreMeta, StoreMode,
+    read_meta, read_mode, write_meta,
+};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_identity;

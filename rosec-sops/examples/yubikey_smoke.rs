@@ -8,7 +8,7 @@
 //!
 //! ```sh
 //! devenv shell -- cargo run -p rosec-sops --example yubikey_smoke -- \
-//!     ~/Nextcloud/drag0nius@nc.nazarewk.pw/important/rosec-storage \
+//!     ~/Nextcloud/rosec-store \
 //!     ~/.config/sops/age/keys.txt \
 //!     age1yubikey1…
 //! ```

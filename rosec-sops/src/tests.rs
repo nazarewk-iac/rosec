@@ -19,6 +19,7 @@ use crate::provider::{
     ATTR_COLLECTION, ATTR_COLLECTION_DIR, ATTR_CONFLICT, INTERNAL_ATTRIBUTES, SopsProvider, new_id,
 };
 use crate::store::{COLLECTION_META, SUPERSEDED_PREFIX, SYNCTHING_CONFLICT_MARKER};
+use crate::store_mode::StoreMode;
 use crate::{SopsConfig, SopsError};
 
 // ---------------------------------------------------------------------------
@@ -43,6 +44,11 @@ impl Fixture {
         let root = dir.path().join("store");
         let key_file = dir.path().join("age-keys.txt");
         let recipient = generate_identity(&key_file);
+        std::fs::create_dir_all(&root).expect("store root");
+        // Every store carries an explicit mode: `direct` keeps the original
+        // behaviour (items encrypted to the unlock key itself).
+        crate::store_mode::write_meta(&root, &crate::store_mode::StoreMeta::new(StoreMode::Direct))
+            .expect("store metadata");
         Self {
             _dir: dir,
             root,
@@ -321,7 +327,7 @@ async fn create_with_replace_matches_by_attribute_subset() {
     unlock(&provider).await;
 
     let mut login = new_item("login", &[("password", "pw")]);
-    login.attributes.insert("username".into(), "kdn".into());
+    login.attributes.insert("username".into(), "user".into());
     let first = provider.create_item(login.clone(), false).await.unwrap();
 
     // Same attributes and secrets: an update, so the same file.
@@ -347,7 +353,7 @@ async fn search_matches_attribute_subsets() {
     unlock(&provider).await;
 
     let mut login = new_item("login", &[("password", "pw")]);
-    login.attributes.insert("username".into(), "kdn".into());
+    login.attributes.insert("username".into(), "user".into());
     let login_id = provider.create_item(login, false).await.unwrap();
     provider
         .create_item(new_item("note", &[("secret", "text")]), false)
@@ -355,7 +361,7 @@ async fn search_matches_attribute_subsets() {
         .unwrap();
 
     let mut query = HashMap::new();
-    query.insert("username".to_string(), "kdn".to_string());
+    query.insert("username".to_string(), "user".to_string());
     let hits = provider.search(&query).await.unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, login_id);
@@ -401,7 +407,7 @@ async fn client_attributes_cannot_forge_provider_managed_names() {
     item.attributes
         .insert(ATTR_COLLECTION_DIR.into(), "work".into());
     item.attributes.insert(ATTR_CONFLICT.into(), "true".into());
-    item.attributes.insert("username".into(), "kdn".into());
+    item.attributes.insert("username".into(), "user".into());
     let id = provider.create_item(item, false).await.unwrap();
 
     let attrs = provider.get_item_attributes(&id).await.unwrap().public;
@@ -418,7 +424,7 @@ async fn client_attributes_cannot_forge_provider_managed_names() {
         !attrs.contains_key(ATTR_CONFLICT),
         "a client must not be able to forge the conflict flag"
     );
-    assert_eq!(attrs.get("username").map(String::as_str), Some("kdn"));
+    assert_eq!(attrs.get("username").map(String::as_str), Some("user"));
 
     // The stored document does not carry the forged values either.
     let stored = provider
@@ -645,6 +651,7 @@ async fn an_update_never_narrows_the_recipient_list() {
         modified: Some(Timestamp::now()),
         host: Some("other".into()),
         revision: 1,
+        version: crate::document::DOCUMENT_VERSION,
     };
     let hand = crate::SopsCommand::new("sops", &fixture.key_file);
     let plain = document.to_yaml().unwrap();
@@ -773,7 +780,7 @@ async fn without_age_recipient_and_without_a_rule_the_write_fails_cleanly() {
 
 #[test]
 fn accepts_a_comma_separated_recipient_list() {
-    let a = "age1yubikey1q25g9xpunct74wnn29dgcgep78q666dkhpfg2flltg92fvyrew02j28464d";
+    let a = "age1yubikey1qtestrecipient0000000000000000000000000000000000000000000";
     let b = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
     let config = SopsConfig::new("/tmp/store", "/tmp/keys.txt", format!("{a}, {b}"), "sops")
         .expect("a list of recipients is valid");
@@ -1350,7 +1357,7 @@ fn rejects_bad_paths_and_recipients() {
         SopsConfig::new(
             "relative/store",
             "/tmp/keys.txt",
-            "age1yubikey1q25g9xpunct74wnn29dgcgep78q666dkhpfg2flltg92fvyrew02j28464d",
+            "age1yubikey1qtestrecipient0000000000000000000000000000000000000000000",
             "sops"
         )
         .is_err()
@@ -1360,7 +1367,7 @@ fn rejects_bad_paths_and_recipients() {
         SopsConfig::new(
             "/tmp/store",
             "keys.txt",
-            "age1yubikey1q25g9xpunct74wnn29dgcgep78q666dkhpfg2flltg92fvyrew02j28464d",
+            "age1yubikey1qtestrecipient0000000000000000000000000000000000000000000",
             "sops"
         )
         .is_err()
@@ -1371,7 +1378,7 @@ fn rejects_bad_paths_and_recipients() {
     let config = SopsConfig::new(
         "~/store",
         "~/.config/sops/age/keys.txt",
-        "age1yubikey1q25g9xpunct74wnn29dgcgep78q666dkhpfg2flltg92fvyrew02j28464d",
+        "age1yubikey1qtestrecipient0000000000000000000000000000000000000000000",
         "sops",
     )
     .expect("tilde paths are accepted");
@@ -1470,6 +1477,7 @@ async fn collection_label_comes_from_the_meta_file() {
         modified: Some(Timestamp::now()),
         host: Some("t".into()),
         revision: 1,
+        version: crate::document::DOCUMENT_VERSION,
     };
     fixture_copy_to(&fixture, "work", "manual.sops.yaml", &doc).await;
     let items = provider.list_items().await.unwrap();
@@ -1538,7 +1546,7 @@ fn provider_declares_write_capability() {
     let config = SopsConfig::new(
         "/tmp/store",
         fixture_key,
-        "age1yubikey1q25g9xpunct74wnn29dgcgep78q666dkhpfg2flltg92fvyrew02j28464d",
+        "age1yubikey1qtestrecipient0000000000000000000000000000000000000000000",
         "sops",
     )
     .unwrap();

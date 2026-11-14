@@ -76,6 +76,83 @@ pub struct Cli {
 pub enum Command {
     /// Inspect and resolve recorded conflicts.
     Conflicts(ConflictsArgs),
+    /// Create, inspect and rotate the derived sops identity.
+    Identity(IdentityArgs),
+    /// Initialise the store mode and migrate a store.
+    Store(StoreArgs),
+}
+
+/// `rosec-sops identity …`
+#[derive(Debug, Args)]
+pub struct IdentityArgs {
+    #[command(subcommand)]
+    pub action: IdentityCommand,
+}
+
+/// `rosec-sops identity <action>`
+#[derive(Debug, Subcommand)]
+pub enum IdentityCommand {
+    /// Generate the derived identity, its master file and the recipient sidecar.
+    Init {
+        /// Overwrite an existing master file (every existing item stays
+        /// encrypted to the old identity).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the derived recipient, the master path and the runtime state.
+    Show,
+    /// Re-wrap the master file to the current `.sops.yaml` master rule.
+    Rewrap,
+    /// Generate a new derived identity and re-encrypt every item.
+    Rekey {
+        /// Rotate even when the old master file is gone.
+        #[arg(long)]
+        force: bool,
+    },
+    /// One-time move of a direct store's items onto the derived identity.
+    Migrate,
+}
+
+/// `rosec-sops store …`
+#[derive(Debug, Args)]
+pub struct StoreArgs {
+    #[command(subcommand)]
+    pub action: StoreCommand,
+}
+
+/// `rosec-sops store <action>`
+#[derive(Debug, Subcommand)]
+pub enum StoreCommand {
+    /// Write the plaintext store metadata (`.rosec-store.yaml`).
+    Init {
+        /// `direct`: item files are encrypted to the unlock keys.
+        /// `derived`: item files are encrypted to a derived sops identity.
+        #[arg(long, value_name = "direct|derived")]
+        mode: String,
+        /// Replace an existing metadata file.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Copy a store into a new one, optionally with a different mode.
+    Migrate {
+        /// Source store root.
+        #[arg(long, value_name = "PATH")]
+        from: PathBuf,
+        /// Destination store root (new or empty).
+        #[arg(long, value_name = "PATH")]
+        to: PathBuf,
+        /// Mode of the destination, when it has no metadata yet.
+        #[arg(long, value_name = "direct|derived")]
+        mode: Option<String>,
+        /// Write into an existing destination directory.
+        #[arg(long)]
+        force: bool,
+        /// Replace files that already exist in the destination.
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// Show the recorded store mode.
+    Show,
 }
 
 /// `rosec-sops conflicts …`
@@ -306,6 +383,18 @@ fn select<'a>(
     }
 }
 
+/// Wrap an async closure for [`with_target`].
+macro_rules! run_action {
+    ($target:ident => $body:expr) => {
+        |$target: &Target| {
+            Box::pin(async move { $body })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = std::result::Result<(), String>> + '_>,
+                >
+        }
+    };
+}
+
 /// Run one command and print its result. Returns the process exit code.
 pub async fn run(cli: Cli) -> i32 {
     // `clap`'s `env` feature is not in the workspace build, so the two
@@ -329,7 +418,308 @@ pub async fn run(cli: Cli) -> i32 {
                 resolve(config, store, cli.provider.as_deref(), &item, &keep).await
             }
         },
+        Command::Identity(args) => {
+            match args.action {
+                IdentityCommand::Init { force } => with_target(
+                    config,
+                    store,
+                    cli.provider.as_deref(),
+                    run_action!(target => crate::identity_cli::init(&target.config, force).await),
+                )
+                .await,
+                IdentityCommand::Show => {
+                    with_target(
+                        config,
+                        store,
+                        cli.provider.as_deref(),
+                        run_action!(target => crate::identity_cli::show(&target.config).await),
+                    )
+                    .await
+                }
+                IdentityCommand::Rewrap => {
+                    with_target(
+                        config,
+                        store,
+                        cli.provider.as_deref(),
+                        run_action!(target => crate::identity_cli::rewrap(&target.config).await),
+                    )
+                    .await
+                }
+                IdentityCommand::Rekey { force } => with_target(
+                    config,
+                    store,
+                    cli.provider.as_deref(),
+                    run_action!(target => crate::identity_cli::rekey(&target.config, force).await),
+                )
+                .await,
+                IdentityCommand::Migrate => {
+                    with_target(
+                        config,
+                        store,
+                        cli.provider.as_deref(),
+                        run_action!(target => crate::identity_cli::migrate(&target.config).await),
+                    )
+                    .await
+                }
+            }
+        }
+        Command::Store(args) => match args.action {
+            StoreCommand::Init { mode, force } => {
+                store_init(config, store, cli.provider.as_deref(), &mode, force).await
+            }
+            StoreCommand::Migrate {
+                from,
+                to,
+                mode,
+                force,
+                overwrite,
+            } => {
+                store_migrate(
+                    config,
+                    store,
+                    cli.provider.as_deref(),
+                    &from,
+                    &to,
+                    mode.as_deref(),
+                    force,
+                    overwrite,
+                )
+                .await
+            }
+            StoreCommand::Show => {
+                with_target(
+                    config,
+                    store,
+                    cli.provider.as_deref(),
+                    run_action!(target => {
+                        let meta = crate::store_mode::read_meta(&target.root)
+                            .map_err(|e| e.to_string())?;
+                        println!("store: {}", target.root.display());
+                        println!("mode:  {}", meta.mode);
+                        Ok(())
+                    }),
+                )
+                .await
+            }
+        },
     }
+}
+
+/// Resolve the target, run `action`, and map its result to an exit code.
+///
+/// Exit 2 is a configuration or usage problem (no store, no mode, a mismatch),
+/// exit 1 a failed operation. Both print `error: …` on stderr.
+async fn with_target<F>(
+    config: Option<&Path>,
+    store: Option<&Path>,
+    provider: Option<&str>,
+    action: F,
+) -> i32
+where
+    F: for<'a> FnOnce(
+        &'a Target,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::result::Result<(), String>> + 'a>,
+    >,
+{
+    let target = match resolve_target(config, store, provider) {
+        Ok(target) => target,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return 2;
+        }
+    };
+    match action(&target).await {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("error: {e}");
+            2
+        }
+    }
+}
+
+/// `rosec-sops store init --mode direct|derived`
+async fn store_init(
+    config: Option<&Path>,
+    store: Option<&Path>,
+    provider: Option<&str>,
+    mode: &str,
+    force: bool,
+) -> i32 {
+    let target = match resolve_target(config, store, provider) {
+        Ok(target) => target,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return 2;
+        }
+    };
+    let mode = match crate::store_mode::StoreMode::parse(mode) {
+        Ok(mode) => mode,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+    };
+    let root = &target.root;
+    if let Ok(existing) = crate::store_mode::read_meta(root) {
+        if existing.mode == mode {
+            println!("`{}` is already `{mode}`", root.display());
+            return 0;
+        }
+        if !force {
+            eprintln!(
+                "error: `{}` is already `{}`; the mode never changes in place. Create a new store \
+                 with `--mode {}` and run `rosec-sops store migrate --from` into it",
+                root.display(),
+                existing.mode,
+                mode
+            );
+            return 2;
+        }
+        // Even `--force` cannot rewrite the mode: every item file was written
+        // for the other one.
+        eprintln!(
+            "error: refusing to change the mode of `{}` from `{}` to `{mode}`: existing item \
+             files would become unreadable. Migrate into a new store instead",
+            root.display(),
+            existing.mode
+        );
+        return 2;
+    }
+    if let Err(e) = std::fs::create_dir_all(root) {
+        eprintln!("error: cannot create `{}`: {e}", root.display());
+        return 2;
+    }
+    if let Err(e) = crate::store_mode::write_meta(root, &crate::store_mode::StoreMeta::new(mode)) {
+        eprintln!("error: {e}");
+        return 2;
+    }
+    println!(
+        "store mode: {mode} (written to {})",
+        crate::store_mode::StoreMeta::path(root).display()
+    );
+    match mode {
+        crate::store_mode::StoreMode::Direct => {
+            println!("this store keeps encrypting items to the unlock keys; nothing else to do");
+        }
+        crate::store_mode::StoreMode::Derived => {
+            println!(
+                "next: add the master rule to `{}/.sops.yaml`, then run",
+                root.display()
+            );
+            println!("  rosec-sops --store {} identity init", root.display());
+        }
+    }
+    0
+}
+
+/// `rosec-sops store migrate --from <src> --to <dst>`
+#[allow(clippy::too_many_arguments)]
+async fn store_migrate(
+    config: Option<&Path>,
+    store: Option<&Path>,
+    provider: Option<&str>,
+    from: &Path,
+    to: &Path,
+    mode: Option<&str>,
+    force: bool,
+    overwrite: bool,
+) -> i32 {
+    let mode = match mode.map(crate::store_mode::StoreMode::parse) {
+        Some(Ok(mode)) => Some(mode),
+        Some(Err(e)) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+        None => None,
+    };
+    // The identity that opens the source: the entry named by `--config`, else
+    // `SOPS_AGE_KEY_FILE`, else the default key file.
+    let source_key_file = match resolve_target(config, Some(from), provider) {
+        Ok(target) => target.config.key_file.clone(),
+        Err(message) => {
+            eprintln!("error: {message}");
+            return 2;
+        }
+    };
+    let sops_binary = resolve_target(config, Some(from), provider)
+        .map(|target| target.config.sops_binary)
+        .unwrap_or_else(|_| PathBuf::from(crate::DEFAULT_SOPS_BINARY));
+    let options = crate::store_migrate::MigrationOptions {
+        from: from.to_path_buf(),
+        to: to.to_path_buf(),
+        source_key_file,
+        sops_binary,
+        mode,
+        force,
+        overwrite,
+    };
+    let _ = store;
+    let report = match crate::store_migrate::migrate_store(&options, |destination| {
+        let mut entry = std::collections::HashMap::new();
+        entry.insert(
+            "path".to_string(),
+            serde_json::Value::String(destination.display().to_string()),
+        );
+        let config = SopsConfig::from_options(None, &entry)
+            .unwrap_or_else(|_| SopsConfig::new(destination, "/dev/null", "", "sops").unwrap());
+        if let Some(identity) = destination
+            .join(crate::STORE_IDENTITY_FILE)
+            .is_file()
+            .then(|| crate::store_identity_path(destination))
+        {
+            SopsConfig {
+                identity_file: Some(identity),
+                ..config
+            }
+        } else {
+            config
+        }
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    println!(
+        "migrated {} file(s) from `{}` ({}) to `{}` ({})",
+        report.items,
+        report.from.display(),
+        report
+            .from_mode
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "no mode".into()),
+        report.to.display(),
+        report.to_mode,
+    );
+    if !report.collections.is_empty() {
+        println!(
+            "collections: {}",
+            report
+                .collections
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !report.skipped.is_empty() {
+        println!(
+            "WARNING: {} file(s) could not be decrypted with the source key:",
+            report.skipped.len()
+        );
+        for path in &report.skipped {
+            println!("  {}", path.display());
+        }
+    }
+    println!(
+        "next: point the provider at `{}` (and its `identity_file` when the mode is derived)",
+        report.to.display()
+    );
+    0
 }
 
 async fn list(

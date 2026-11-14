@@ -77,7 +77,7 @@ fn safe_component(name: &str) -> String {
 pub struct CopyMeta {
     /// Path relative to the store root, e.g.
     /// `default/item-abc.sops.yaml` or
-    /// `default/.superseded-item-abc.1763…-oams.sops.yaml`.
+    /// `default/.superseded-item-abc.1763…-host-a.sops.yaml`.
     pub file: String,
     /// `modified` of the copy, RFC 3339. Absent when the document has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -449,23 +449,23 @@ mod tests {
             label: "github.com".into(),
             winner: "default/item-abc.sops.yaml".into(),
             losers: vec![CopyMeta {
-                file: "default/.superseded-item-abc.1763150000000000000-oams.sops.yaml".into(),
+                file: "default/.superseded-item-abc.1763150000000000000-host-a.sops.yaml".into(),
                 modified: Some("2026-11-14T18:41:09Z".into()),
-                host: Some("oams".into()),
+                host: Some("host-a".into()),
                 revision: 8,
                 secrets: vec!["password".into()],
             }],
             winner_meta: Some(CopyMeta {
                 file: "default/item-abc.sops.yaml".into(),
                 modified: Some("2026-11-14T18:42:00Z".into()),
-                host: Some("oams".into()),
+                host: Some("host-a".into()),
                 revision: 9,
                 secrets: vec!["password".into()],
             }),
             written: now_text(),
             attributes: std::collections::BTreeMap::from([(
                 "username".to_string(),
-                "kdn".to_string(),
+                "user".to_string(),
             )]),
             hint: RESOLUTION_HINT.into(),
         }

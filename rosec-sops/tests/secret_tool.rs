@@ -58,6 +58,13 @@ impl Fixture {
             .find(|word| word.starts_with("age1"))
             .expect("recipient in age-keygen output")
             .to_string();
+        // The store mode is explicit; this store keeps the direct behaviour.
+        std::fs::create_dir_all(&root).expect("store root");
+        rosec_sops::write_meta(
+            &root,
+            &rosec_sops::StoreMeta::new(rosec_sops::StoreMode::Direct),
+        )
+        .expect("store metadata");
         Self {
             _dir: dir,
             root,
@@ -163,7 +170,7 @@ async fn secret_tool_roundtrip_through_the_sops_store() {
             "service".into(),
             "it-rosec-sops".into(),
             "username".into(),
-            "kdn".into(),
+            "user".into(),
         ],
         Some(secret.to_owned()),
     )
@@ -190,7 +197,7 @@ async fn secret_tool_roundtrip_through_the_sops_store() {
             "service".into(),
             "it-rosec-sops".into(),
             "username".into(),
-            "kdn".into(),
+            "user".into(),
         ],
         None,
     )

@@ -62,7 +62,7 @@ async fn conflicted_store(
         content_types: HashMap::new(),
         label: "cli demo".into(),
         item_type: None,
-        attributes: HashMap::from([("username".to_string(), "kdn".to_string())]),
+        attributes: HashMap::from([("username".to_string(), "user".to_string())]),
         secrets: HashMap::from([(
             "password".to_string(),
             SecretBytes::new(SECRET.as_bytes().to_vec()),
@@ -125,6 +125,12 @@ async fn lists_shows_and_resolves_a_conflict_through_the_binary() {
         .expect("recipient")
         .to_owned();
 
+    std::fs::create_dir_all(&root).expect("store root");
+    rosec_sops::write_meta(
+        &root,
+        &rosec_sops::StoreMeta::new(rosec_sops::StoreMode::Direct),
+    )
+    .expect("store metadata");
     let config = SopsConfig::new(&root, &key_file, &recipient, "sops").expect("config");
     let provider = SopsProvider::new("cli-test", config);
     provider
@@ -216,4 +222,163 @@ fn refuses_an_unknown_item_id() {
     // A bare id that no marker names is refused too.
     let (code, _stdout, stderr) = run(dir.path(), &["conflicts", "list"]);
     assert_eq!(code, 0, "{stderr}");
+}
+
+/// End to end through the binary: adopt a direct store, create a derived one,
+/// migrate into it, inspect it. Every output is searched for the item secret.
+#[tokio::test(flavor = "current_thread")]
+async fn store_and_identity_commands_migrate_a_store_through_the_binary() {
+    if !has_tools() {
+        eprintln!("SKIP: sops or age-keygen missing");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let source = dir.path().join("source");
+    let destination = dir.path().join("destination");
+    let key_file = dir.path().join("age-keys.txt");
+    let recipient = age_recipient(&key_file);
+    std::fs::create_dir_all(&source).unwrap();
+
+    // A direct store adopted with `store init --mode direct`, plus one item.
+    let (code, stdout, stderr) = run(&source, &["store", "init", "--mode", "direct"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("direct"), "{stdout}");
+    // A second, different mode is refused.
+    let (code, _stdout, stderr) = run(&source, &["store", "init", "--mode", "derived", "--force"]);
+    assert_eq!(code, 2, "the mode must not change in place");
+    assert!(stderr.contains("Migrate into a new store"), "{stderr}");
+
+    let config = SopsConfig::new(&source, &key_file, &recipient, "sops").expect("config");
+    let provider = SopsProvider::new("cli-cli", config);
+    provider
+        .unlock(UnlockInput::Password(Zeroizing::new(String::new())))
+        .await
+        .expect("unlock");
+    let id = provider
+        .create_item(
+            NewItem {
+                content_types: HashMap::new(),
+                label: "migrated".into(),
+                item_type: None,
+                attributes: HashMap::new(),
+                secrets: HashMap::from([(
+                    "password".to_string(),
+                    SecretBytes::new(SECRET.as_bytes().to_vec()),
+                )]),
+            },
+            false,
+        )
+        .await
+        .expect("create");
+    // The daemon seeded a `default` collection: the store has items now.
+    let _ = id;
+
+    // Derived destination: mode, `.sops.yaml`, `identity init`.
+    let (code, stdout, stderr) = run(&destination, &["store", "init", "--mode", "derived"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("identity init"), "{stdout}");
+    // Master rule first; the item rule is filled in after `identity init`
+    // has printed the derived recipient.
+    std::fs::write(
+        destination.join(".sops.yaml"),
+        format!(
+            "creation_rules:\n\
+             \x20 - path_regex: ^\\.rosec-store-identity\\.sops\\.yaml$\n\
+             \x20   age: {recipient}\n"
+        ),
+    )
+    .unwrap();
+    let key = key_file.display().to_string();
+    let (code, stdout, stderr) = run_env(
+        &destination,
+        &["identity", "init"],
+        &[("SOPS_AGE_KEY_FILE", key.as_str())],
+    );
+    assert_eq!(code, 0, "identity init failed: {stderr}");
+    assert!(stdout.contains("derived recipient:"), "{stdout}");
+    assert!(
+        !stdout.contains("AGE-SECRET-KEY-1"),
+        "a key leaked: {stdout}"
+    );
+    assert!(
+        !stderr.contains("AGE-SECRET-KEY-1"),
+        "a key leaked: {stderr}"
+    );
+
+    // Point the item rule at the derived recipient, as the init hint says.
+    let derived = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("derived recipient: "))
+        .expect("derived recipient")
+        .trim()
+        .to_owned();
+    std::fs::write(
+        destination.join(".sops.yaml"),
+        format!(
+            "creation_rules:\n\
+             \x20 - path_regex: ^\\.rosec-store-identity\\.sops\\.yaml$\n\
+             \x20   age: {recipient}\n\
+             \x20 - path_regex: .*\\.sops\\.yaml$\n\
+             \x20   age: {derived}\n"
+        ),
+    )
+    .unwrap();
+
+    // `identity show` needs no decryption and prints no secret.
+    let (code, stdout, stderr) = run(&destination, &["identity", "show"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("mode:              derived"), "{stdout}");
+    assert!(stdout.contains("runtime identity:  absent"), "{stdout}");
+    assert!(!stdout.contains("AGE-SECRET-KEY-1"), "{stdout}");
+
+    // Migrate the direct store into the derived one.
+    let from = source.display().to_string();
+    let to = destination.display().to_string();
+    let (code, stdout, stderr) = run_env(
+        &source,
+        &["store", "migrate", "--from", &from, "--to", &to],
+        &[("SOPS_AGE_KEY_FILE", key.as_str())],
+    );
+    assert_eq!(code, 0, "migrate failed: {stdout}{stderr}");
+    assert!(stdout.contains("migrated 1 file(s)"), "{stdout}");
+    assert!(stdout.contains("direct"), "{stdout}");
+    assert!(stdout.contains("derived"), "{stdout}");
+    assert!(!stdout.contains(SECRET), "a secret leaked: {stdout}");
+
+    // The copied item is in the destination and opens with the derived key.
+    let copied = destination.join("default").join(format!("{id}.sops.yaml"));
+    assert!(
+        copied.is_file(),
+        "the item was not copied to {}",
+        copied.display()
+    );
+    assert!(
+        rosec_sops::SopsCommand::new("sops", &key_file)
+            .decrypt(&copied)
+            .await
+            .is_err(),
+        "the source key must not read the migrated item"
+    );
+
+    // A store without a mode is refused with the fix.
+    let bare = dir.path().join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    let (code, _stdout, stderr) = run(&bare, &["store", "show"]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("store init --mode"), "{stderr}");
+}
+
+/// The public recipient of a freshly generated identity file.
+fn age_recipient(key_file: &Path) -> String {
+    let output = Command::new("age-keygen")
+        .arg("-o")
+        .arg(key_file)
+        .output()
+        .expect("age-keygen");
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stderr)
+        .split_whitespace()
+        .find(|word| word.starts_with("age1"))
+        .expect("recipient")
+        .to_owned()
 }

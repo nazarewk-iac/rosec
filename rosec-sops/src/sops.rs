@@ -23,6 +23,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
@@ -37,11 +38,23 @@ use crate::error::SopsError;
 /// unplugged token cannot hang `rosec unlock`.
 pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Prefix of every age secret key.
+pub const AGE_SECRET_PREFIX: &str = "AGE-SECRET-KEY-1";
+
+/// File name an item write tells sops to pretend it reads, so that an item
+/// creation rule matches. Public: the identity migration uses the same name for
+/// the destination store.
+pub const ENCRYPT_NAME: &str = "rosec-encrypt-input.sops.yaml";
+
 /// A configured `sops` binary plus the age identity file it must use.
+///
+/// The identity file is **mutable**: `unlock` replaces it with the runtime file
+/// of the unwrapped derived identity for the session, `lock` resets it. The
+/// handle is cheap to clone and every clone sees the same value.
 #[derive(Debug, Clone)]
 pub struct SopsCommand {
     binary: PathBuf,
-    key_file: PathBuf,
+    key_file: Arc<RwLock<PathBuf>>,
     probe_timeout: Duration,
 }
 
@@ -50,7 +63,7 @@ impl SopsCommand {
     pub fn new(binary: impl Into<PathBuf>, key_file: impl Into<PathBuf>) -> Self {
         Self {
             binary: binary.into(),
-            key_file: key_file.into(),
+            key_file: Arc::new(RwLock::new(key_file.into())),
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
         }
     }
@@ -62,35 +75,55 @@ impl SopsCommand {
     }
 
     /// The identity file this wrapper exports as `SOPS_AGE_KEY_FILE`.
-    pub fn key_file(&self) -> &Path {
-        &self.key_file
+    pub fn key_file(&self) -> PathBuf {
+        self.key_file
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
-    /// Check that the binary runs and that the identity file exists.
+    /// Point every later operation at another identity file.
+    ///
+    /// `unlock` sets the runtime file of the derived identity, `lock` sets the
+    /// configured `key_file` back.
+    pub fn set_key_file(&self, path: impl Into<PathBuf>) {
+        *self.key_file.write().unwrap_or_else(|e| e.into_inner()) = path.into();
+    }
+
+    /// The configured `sops` executable.
+    pub fn binary(&self) -> &Path {
+        &self.binary
+    }
+
+    /// Check that the binary runs and that `key_file` (when given) exists.
     ///
     /// Runs `sops --version`, which reads neither the key nor any store file.
     /// Both failures are reported as [`SopsError::Unavailable`] so `unlock` can
     /// name the missing piece. This proves nothing about readability — see
     /// [`SopsCommand::probe_decrypt`].
-    pub async fn probe(&self) -> Result<String, SopsError> {
-        if !self.key_file.is_file() {
+    ///
+    /// `key_file` is `None` when a session already has its derived identity in
+    /// `runtime_identity_file`: the store then unlocks without the YubiKey.
+    pub async fn probe(&self, key_file: Option<&Path>) -> Result<String, SopsError> {
+        if let Some(key_file) = key_file
+            && !key_file.is_file()
+        {
             return Err(SopsError::Unavailable(format!(
                 "age identity file `{}` does not exist (set `options.key_file`)",
-                self.key_file.display()
+                key_file.display()
             )));
         }
-        let output = Command::new(&self.binary)
-            .args(["--version", "--check-for-updates=false"])
-            .env("SOPS_AGE_KEY_FILE", &self.key_file)
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .map_err(|e| {
-                SopsError::Unavailable(format!(
-                    "cannot run `{}`: {e} (set `options.sops_binary`)",
-                    self.binary.display()
-                ))
-            })?;
+        let mut command = Command::new(&self.binary);
+        command.args(["--version", "--check-for-updates=false"]);
+        if let Some(key_file) = key_file {
+            command.env("SOPS_AGE_KEY_FILE", key_file);
+        }
+        let output = command.stdin(Stdio::null()).output().await.map_err(|e| {
+            SopsError::Unavailable(format!(
+                "cannot run `{}`: {e} (set `options.sops_binary`)",
+                self.binary.display()
+            ))
+        })?;
         if !output.status.success() {
             return Err(SopsError::SopsFailed {
                 args: "--version".into(),
@@ -134,6 +167,37 @@ impl SopsCommand {
         recipients: Option<&str>,
         cwd: &Path,
     ) -> Result<Vec<u8>, SopsError> {
+        self.encrypt_as(plaintext, recipients, cwd, ENCRYPT_NAME)
+            .await
+    }
+
+    /// Encrypt to explicit age recipients, ignoring every creation rule.
+    ///
+    /// Used by the master file and by the identity migration: the recipient
+    /// set is decided by the caller, so no `.sops.yaml` rule can widen or
+    /// narrow it.
+    pub async fn encrypt_to(
+        &self,
+        plaintext: &[u8],
+        recipients: &str,
+        cwd: &Path,
+    ) -> Result<Vec<u8>, SopsError> {
+        self.encrypt_as(plaintext, Some(recipients), cwd, ENCRYPT_NAME)
+            .await
+    }
+
+    /// Encrypt one document, naming the file sops must pretend to read.
+    ///
+    /// `filename_override` is what the creation rules of `.sops.yaml` are
+    /// matched against, so the caller decides which rule applies — an item
+    /// rule for an item, the master rule for the master file.
+    pub async fn encrypt_as(
+        &self,
+        plaintext: &[u8],
+        recipients: Option<&str>,
+        cwd: &Path,
+        filename_override: &str,
+    ) -> Result<Vec<u8>, SopsError> {
         let mut args = vec!["--encrypt".to_string()];
         // sops keeps only the last of repeated `--age` flags; a comma-joined
         // list in one flag encrypts to every recipient.
@@ -155,7 +219,7 @@ impl SopsCommand {
             // match, so it must look like an item file — a bare
             // `rosec-item.yaml` matches `.sops.yaml` rules only by accident.
             "--filename-override".to_string(),
-            "rosec-encrypt-input.sops.yaml".to_string(),
+            filename_override.to_string(),
             "/dev/stdin".to_string(),
         ]);
         let output = self.run(&args, Some(plaintext), Some(cwd), None).await?;
@@ -167,6 +231,60 @@ impl SopsCommand {
             });
         }
         Ok(output.stdout)
+    }
+
+    /// Decrypt one YAML file and return the selected field.
+    ///
+    /// `--extract` runs inside sops, so the rest of the document never reaches
+    /// this process. Used to read `identity:` out of the master file.
+    pub async fn decrypt_field(&self, path: &Path, extract: &str) -> Result<Vec<u8>, SopsError> {
+        let args = vec![
+            "--decrypt".to_string(),
+            "--extract".to_string(),
+            extract.to_string(),
+            "--input-type".to_string(),
+            "yaml".to_string(),
+            "--output-type".to_string(),
+            "yaml".to_string(),
+            "--filename-override".to_string(),
+            "rosec-item.sops.yaml".to_string(),
+            path.display().to_string(),
+        ];
+        let output = self
+            .run(&args, None, path.parent(), Some(self.probe_timeout))
+            .await?;
+        if !output.status.success() {
+            return Err(SopsError::SopsFailed {
+                args: join_args(&args),
+                status: describe_status(output.status),
+                reason: classify_stderr(&output.stderr),
+            });
+        }
+        Ok(output.stdout)
+    }
+
+    /// Re-encrypt the file header to the recipients of the current rule.
+    ///
+    /// Runs `sops updatekeys --yes <path>` with `cwd`, so the store's
+    /// `.sops.yaml` decides the new recipient set: a key added to the rule is
+    /// added to the file, a key removed from the rule is removed from the
+    /// file. The payload is decrypted with the key file of this wrapper, so
+    /// the operation needs one identity that is still in the file.
+    pub async fn update_keys(&self, path: &Path, cwd: &Path) -> Result<(), SopsError> {
+        let args = vec![
+            "updatekeys".to_string(),
+            "--yes".to_string(),
+            path.display().to_string(),
+        ];
+        let output = self.run(&args, None, Some(cwd), None).await?;
+        if !output.status.success() {
+            return Err(SopsError::SopsFailed {
+                args: join_args(&args),
+                status: describe_status(output.status),
+                reason: classify_stderr(&output.stderr),
+            });
+        }
+        Ok(())
     }
 
     /// Decrypt one file into plaintext bytes.
@@ -225,10 +343,11 @@ impl SopsCommand {
         cwd: Option<&Path>,
         timeout: Option<Duration>,
     ) -> Result<std::process::Output, SopsError> {
+        let key_file = self.key_file();
         let mut command = Command::new(&self.binary);
         command
             .args(args)
-            .env("SOPS_AGE_KEY_FILE", &self.key_file)
+            .env("SOPS_AGE_KEY_FILE", &key_file)
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {
@@ -451,6 +570,70 @@ pub async fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), SopsError> 
     Ok(())
 }
 
+/// Blocking [`write_atomic`] with an explicit file mode.
+///
+/// The CLI and the unlock path are short-lived and synchronous around these
+/// writes, so they call this from a plain function. `mode` is `0600` for a
+/// secret file and `0644` for a public one; the temporary file always starts
+/// private and is widened to `mode` after the write, before the rename, so the
+/// target never exists with wider permissions than requested.
+pub fn write_atomic_mode(target: &Path, bytes: &[u8], mode: u32) -> Result<(), SopsError> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let dir = target.parent().ok_or_else(|| {
+        SopsError::Config(format!("`{}` has no parent directory", target.display()))
+    })?;
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp = dir.join(format!(".{name}.{}.{unique}.tmp", std::process::id()));
+    struct Cleanup(Option<PathBuf>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(path) = self.0.take() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    let mut cleanup = Cleanup(Some(temp.clone()));
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode_private()
+        .open(&temp)
+        .map_err(|e| SopsError::io(temp.display(), e))?;
+    file.write_all(bytes)
+        .map_err(|e| SopsError::io(temp.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .map_err(|e| SopsError::io(temp.display(), e))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    file.sync_all()
+        .map_err(|e| SopsError::io(temp.display(), e))?;
+    drop(file);
+
+    std::fs::rename(&temp, target).map_err(|e| SopsError::io(target.display(), e))?;
+    cleanup.0 = None;
+    if let Ok(handle) = std::fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+    Ok(())
+}
+
+/// Blocking [`write_atomic_mode`] with mode `0600`, for private files.
+pub fn write_atomic_sync(target: &Path, bytes: &[u8]) -> Result<(), SopsError> {
+    write_atomic_mode(target, bytes, 0o600)
+}
+
 /// `OpenOptionsExt::mode(0o600)` without importing the trait in every caller.
 trait ModePrivate {
     fn mode_private(&mut self) -> &mut Self;
@@ -468,6 +651,90 @@ impl ModePrivate for std::fs::OpenOptions {
             self
         }
     }
+}
+
+/// True when `text` holds an age secret key line.
+pub fn is_age_identity_text(text: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .any(|line| line.starts_with(AGE_SECRET_PREFIX))
+}
+
+/// Run `age-keygen` and return `(secret key, public recipient)`.
+///
+/// Both values are secrets-adjacent: the caller must never print the secret.
+/// The pair is written to a private temporary file and read back, so a
+/// passphrase prompt cannot hang the call (there is no tty to prompt on).
+pub fn generate_age_identity() -> Result<(String, String), SopsError> {
+    let dir = std::env::temp_dir().join(format!(
+        "rosec-agegen-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| SopsError::io(dir.display(), e))?;
+    let result = (|| {
+        let key_path = dir.join("identity.txt");
+        let output = std::process::Command::new("age-keygen")
+            .arg("-o")
+            .arg(&key_path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| SopsError::Unavailable(format!("cannot run `age-keygen`: {e}")))?;
+        if !output.status.success() {
+            return Err(SopsError::Unavailable(
+                "`age-keygen` failed; install the `age` package".into(),
+            ));
+        }
+        let text =
+            std::fs::read_to_string(&key_path).map_err(|e| SopsError::io(key_path.display(), e))?;
+        let secret = text
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with(AGE_SECRET_PREFIX))
+            .ok_or_else(|| SopsError::Unavailable("`age-keygen` printed no identity".into()))?
+            .to_owned();
+        let recipient = public_recipient_for(&secret)?;
+        Ok((secret, recipient))
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// The public age recipient of a secret key, via `age-keygen -y`.
+///
+/// The secret goes over the child's stdin, never through a command line or an
+/// environment variable, so it cannot be seen in `ps` or `/proc`.
+pub fn public_recipient_for(secret: &str) -> Result<String, SopsError> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("age-keygen")
+        .arg("-y")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| SopsError::Unavailable(format!("cannot run `age-keygen -y`: {e}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(format!("{secret}\n").as_bytes())
+            .map_err(|e| SopsError::io("stdin of `age-keygen -y`", e))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| SopsError::io("`age-keygen -y`", e))?;
+    if !output.status.success() {
+        return Err(SopsError::Unavailable(
+            "`age-keygen -y` rejected the derived identity".into(),
+        ));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("age1"))
+        .map(str::to_owned)
+        .ok_or_else(|| SopsError::Unavailable("`age-keygen -y` printed no recipient".into()))
 }
 
 #[cfg(test)]

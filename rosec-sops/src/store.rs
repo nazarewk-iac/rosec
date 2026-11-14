@@ -128,7 +128,27 @@ enum Cached {
 /// wholesale when full. That bounds memory without an LRU implementation.
 #[derive(Debug, Default)]
 pub struct StoreCache {
-    entries: Mutex<HashMap<PathBuf, CacheEntry>>,
+    entries: Mutex<HashMap<CacheKey, CacheEntry>>,
+}
+
+/// Identity of a cache slot: one file, parsed as one type.
+///
+/// The same file can be asked for as two types — `_meta.sops.yaml` is a
+/// `CollectionMeta` to the label reader and a `SopsDocument` to
+/// [`Store::resolve_item`] — so the type is part of the key. A path-only key
+/// made the second request hit a value of the other type and fail with
+/// "cached document has a different type than requested".
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    path: PathBuf,
+    kind: CacheKind,
+}
+
+/// The parsed type a slot holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CacheKind {
+    Item,
+    Meta,
 }
 
 /// One cached file.
@@ -142,30 +162,40 @@ impl StoreCache {
     /// Maximum number of decrypted documents kept in memory.
     pub const CAPACITY: usize = 512;
 
-    /// Look up an entry whose identifying key matches.
-    fn get(&self, key: &FileKey) -> Option<Cached> {
+    fn slot(path: &Path, kind: CacheKind) -> CacheKey {
+        CacheKey {
+            path: path.to_path_buf(),
+            kind,
+        }
+    }
+
+    /// Look up an entry of this type whose identifying key matches.
+    fn get(&self, key: &FileKey, kind: CacheKind) -> Option<Cached> {
+        let slot = Self::slot(&key.path, kind);
         let guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         guard
-            .get(&key.path)
+            .get(&slot)
             .filter(|entry| entry.key == *key)
             .map(|entry| entry.value.clone())
     }
 
-    fn put(&self, key: FileKey, value: Cached) {
+    fn put(&self, key: FileKey, kind: CacheKind, value: Cached) {
+        let slot = Self::slot(&key.path, kind);
         let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.len() >= Self::CAPACITY && !guard.contains_key(&key.path) {
+        if guard.len() >= Self::CAPACITY && !guard.contains_key(&slot) {
             debug!(capacity = Self::CAPACITY, "sops store cache full, clearing");
             guard.clear();
         }
-        guard.insert(key.path.clone(), CacheEntry { key, value });
+        guard.insert(slot, CacheEntry { key, value });
     }
 
-    /// Remove one file from the cache (after a write or a delete).
+    /// Remove one file from the cache (after a write or a delete): every type
+    /// it was cached as.
     fn forget(&self, path: &Path) {
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(path);
+            .retain(|slot, _| slot.path != path);
     }
 
     /// Number of cached documents.
@@ -372,7 +402,14 @@ impl Store {
     /// meta file or the other way round.
     pub async fn load<T: DeserializeOwned + 'static>(&self, path: &Path) -> Result<T, SopsError> {
         let before = stat_key(path)?;
-        if let Some(cached) = self.cache.get(&before) {
+        // The requested type decides the cache slot, so `_meta.sops.yaml` can be
+        // held both as a `CollectionMeta` and as a `SopsDocument`.
+        let kind = if std::any::TypeId::of::<T>() == std::any::TypeId::of::<CollectionMeta>() {
+            CacheKind::Meta
+        } else {
+            CacheKind::Item
+        };
+        if let Some(cached) = self.cache.get(&before, kind) {
             return decode::<T>(cached, path);
         }
 
@@ -380,14 +417,11 @@ impl Store {
             .await
             .map_err(|e| SopsError::io(path.display(), e))?;
         let plain = self.sops.decrypt(path).await?;
-        let is_meta = path
-            .file_name()
-            .map(|name| name.to_string_lossy() == COLLECTION_META)
-            .unwrap_or(false);
-        // Parse straight into the type the file holds: an item file yields a
-        // `SopsDocument`, a collection meta file a `CollectionMeta`. No YAML
-        // re-serialisation is involved, so a field name shared by both types
-        // cannot silently change meaning.
+        let is_meta = kind == CacheKind::Meta;
+        // Parse straight into the type the caller asked for: an item file
+        // yields a `SopsDocument`, a collection meta file a `CollectionMeta`.
+        // No YAML re-serialisation is involved, so a field name shared by both
+        // types cannot silently change meaning.
         let cached = if is_meta {
             Cached::Meta(
                 serde_yaml::from_slice(&plain).map_err(|e| SopsError::Malformed {
@@ -412,7 +446,7 @@ impl Store {
                 sha256: Sha256::digest(&cipher).into(),
                 ..after
             };
-            self.cache.put(key, cached.clone());
+            self.cache.put(key, kind, cached.clone());
         }
 
         decode::<T>(cached, path)
@@ -1367,7 +1401,7 @@ mod tests {
         assert_eq!(item_id_from_file_name("notes.txt"), None);
         // Archived conflict copies are not items.
         assert_eq!(
-            item_id_from_file_name(".superseded-item-ab12.1763150000000000000-oams.sops.yaml"),
+            item_id_from_file_name(".superseded-item-ab12.1763150000000000000-host-a.sops.yaml"),
             None
         );
         // The (retired) `_meta.sops.yaml` name is filtered by the caller, not

@@ -23,21 +23,25 @@ The plaintext document inside each file:
 label: github.com
 attributes:
   rosec:type: login
-  username: kdn
+  username: user
 secrets:
   password: hunter2
 binary_secrets:          # only when a value is not UTF-8, standard base64
   blob: AP+AQQ==
 created: 2026-11-14T18:02:11.000000000Z
 modified: 2026-11-14T18:41:09.417000000Z
-host: oams
+host: host-a
 revision: 7
+version: 1
 ```
 
 - `created` and `modified` are RFC 3339 on write. A bare Unix epoch is accepted
   on read.
 - `revision` counts writes. `host` names the writer, taken from the kernel
   hostname (not `$HOSTNAME`, which a stale shell can export).
+- `version` is the item schema version. A missing field means version 1; a
+  newer version is refused on read instead of being rewritten without its newer
+  fields.
 - `secrets` is a named map (`password`, `private_key`, `totp`, ...) of UTF-8
   text. A value that is not UTF-8 is stored as standard base64 under
   `binary_secrets` and comes back byte for byte — binary secrets are supported.
@@ -66,7 +70,7 @@ concern. The provider has no alias API.
 [[provider]]
 id   = "sops"
 kind = "sops"
-path = "~/Nextcloud/drag0nius@nc.nazarewk.pw/important/rosec-storage"
+path = "~/Nextcloud/rosec-store"
 
 [provider.options]
 key_file      = "~/.config/sops/age/keys.txt"   # default
@@ -78,7 +82,7 @@ probe_timeout_seconds = 30                      # default
 | Option                  | Required | Default                       | Meaning                                   |
 | ----------------------- | -------- | ----------------------------- | ----------------------------------------- |
 | `path`                  | yes      | —                             | Store root                                |
-| `key_file`              | no       | `~/.config/sops/age/keys.txt` | Exported as `SOPS_AGE_KEY_FILE`           |
+| `key_file`              | no       | `~/.config/sops/age/keys.txt` | Exported as `SOPS_AGE_KEY_FILE`; the `direct` identity, and the master's key by default |
 | `age_recipient`         | no       | —                             | Recipients for new and changed files      |
 | `sops_binary`           | no       | `sops`                        | The `sops` executable                     |
 | `probe_timeout_seconds` | no       | `30`                          | Upper bound for the unlock decrypt probe  |
@@ -95,7 +99,7 @@ Every new file is encrypted to all listed recipients, so a shared store stays
 readable on each host with that host's own YubiKey:
 
 ```toml
-age_recipient = "age1yubikey1…oams,age1yubikey1…brys"
+age_recipient = "age1yubikey1…host-a,age1yubikey1…key-b"
 ```
 
 An **update** encrypts to the **union** of this list and the recipients already
@@ -154,6 +158,258 @@ open this file`, `document could not be parsed`, ...) plus the exit code, never
 the stderr text. A test feeds a crafted sops error containing a secret through
 the whole error path.
 
+## Store mode (always explicit)
+
+Every store records **how its item files are encrypted** in a plaintext file
+`<root>/.rosec-store.yaml`:
+
+```yaml
+version: 1
+mode: direct   # or derived
+```
+
+| Mode      | Item files encrypted to                                   | Unlock cost                          |
+| --------- | --------------------------------------------------------- | ------------------------------------ |
+| `direct`  | the unlock keys themselves (the YubiKey recipient)         | one token operation per file decrypt |
+| `derived` | a derived sops identity (see [Unlock once](#unlock-once))  | one token operation per **session**  |
+
+**There is no default.** A store without this file, or with a missing or
+unknown `mode`, is refused:
+
+```text
+error: sops store config: store `…` has no mode: `.rosec-store.yaml` is missing or has
+no valid `mode`. The store mode is always explicit — run `rosec-sops --store … store
+init --mode direct|derived`
+```
+
+The provider refuses to unlock, read or write such a store, and nothing is
+written implicitly. The mode is also checked against the configuration:
+`derived` requires `identity_file`, `direct` forbids it. A mismatch is a
+configuration error, never a silent guess.
+
+`rosec-sops store init --mode <direct|derived>` writes the metadata of an
+existing store:
+
+- `--mode direct` adopts a store that already holds items encrypted to the
+  unlock keys (the behaviour of every store written before this option
+  existed).
+- `--mode derived` only records the mode; `rosec-sops identity init` creates the
+  derived identity afterwards.
+- Two `store init` runs with the same mode are a no-op. A **different** mode is
+  refused, `--force` included: every existing item file was written for the
+  other mode.
+
+**The mode never changes in place.** The only supported way to change it is a
+migration into a new store — see [Migrating a store](#migrating-a-store).
+
+## Unlock once
+
+A `derived` store costs **one YubiKey operation per session** instead of one per
+file. The model has two layers.
+
+### Layer 1: the store identity
+
+The **store identity** is a plain age identity — an `AGE-SECRET-KEY-1…` line.
+Every item file is encrypted to its **public recipient**, which is recorded in
+plaintext in:
+
+```text
+<root>/.rosec-store-identity.recipient     one line, public, no secret
+```
+
+### Layer 2: the master file
+
+The identity itself lives in a sops-encrypted master file:
+
+```text
+<root>/.rosec-store-identity.sops.yaml
+```
+
+```yaml
+identity: ENC[AES256_GCM,…]
+sops:
+  age:
+    - recipient: age1yubikey1…
+```
+
+Its recipients are the **unlock group**, chosen by the creation rule of the
+store's `.sops.yaml` that matches `.rosec-store-identity.sops.yaml`. That rule
+may use `age:`, `pgp:`, `kms:`, `hc_vault:` or any other sops key service, so
+any sops mode works as the unlock. Adding or removing an unlock key is
+`sops updatekeys` on this one file — it never touches an item.
+
+### `.sops.yaml`: the master rule comes FIRST
+
+```yaml
+creation_rules:
+  # 1. the master file: its recipients are the unlock group.
+  - path_regex: ^\.rosec-store-identity\.sops\.yaml$
+    age: age1yubikey1…host-a,age1yubikey1…key-b
+  # 2. the items: encrypted to the derived identity only.
+  - path_regex: .*\.sops\.yaml$
+    age: age1…   # the derived recipient printed by `identity init`
+```
+
+**Order is load bearing.** sops applies the **first** matching rule, and the
+item rule `.*\.sops\.yaml$` also matches the master file name. With the two
+rules reversed, an `identity init` wraps the master to the item recipient — a
+master nobody can open, silently. A test covers exactly that mistake.
+
+Both YubiKeys belong in the master rule, comma-separated, so either host can
+unwrap the store. A paper or offline recovery key may be added to the same list;
+it is ordinary age, so it is unwrapped with `age -d`.
+
+### The CLI
+
+```sh
+rosec-sops identity init [--force]   # derive the identity, write master + sidecar
+rosec-sops identity show             # recipient, paths, runtime state; no decryption
+rosec-sops identity rewrap           # re-wrap the master to the current rule
+rosec-sops identity rekey            # new identity, every item re-encrypted
+rosec-sops identity migrate          # one-time: direct items -> derived identity
+rosec-sops store show                # the recorded mode
+```
+
+- `init` refuses to overwrite an existing master without `--force`, and warns
+  that overwriting leaves every existing item unreadable (they belong to the
+  old identity). It prints only the **public** derived recipient and a
+  ready-to-paste `.sops.yaml` snippet.
+- `show` prints the sidecar recipient, the master path, the unlock key file,
+  the runtime path and whether a runtime identity exists.
+- `rewrap` runs `sops updatekeys --yes <master>` with cwd = the store root, so
+  the master rule decides the new set. It does not change the derived identity:
+  **no item is re-encrypted.**
+- `rekey` rotates the derived identity and re-encrypts every item. This is the
+  strong revocation: the old identity stops reading everything written after
+  it.
+- `migrate` moves a store whose items were encrypted to the unlock keys onto
+  the derived identity, once. It decrypts with `key_file` and re-encrypts to the
+  sidecar's recipient.
+- No command ever prints a secret. The derived identity only travels between
+  the master, the runtime file and a `sops` child process.
+
+### The provider options
+
+```toml
+[provider.options]
+path                = "~/…/rosec-storage"
+identity_file       = "<store>/.rosec-store-identity.sops.yaml"
+identity_key_file   = "~/.config/sops/age/keys.txt"   # only to decrypt the master
+runtime_identity_file = "$XDG_RUNTIME_DIR/rosec/store-identity.age"  # default
+key_file            = "~/.config/sops/age/keys.txt"   # the local unlock identity
+age_recipient       = "age1…"                         # the derived recipient
+```
+
+| Option                   | Required        | Default                                    | Meaning                                        |
+| ------------------------ | --------------- | ------------------------------------------ | ---------------------------------------------- |
+| `identity_file`          | `derived` only  | —                                          | The master file; its presence selects `derived` |
+| `identity_key_file`      | no              | `key_file`                                 | Identity used **only** to decrypt the master    |
+| `runtime_identity_file`  | no              | `$XDG_RUNTIME_DIR/rosec/store-identity.age` | Session cache, `/tmp/rosec-<uid>/…` when unset |
+
+`unlock` then:
+
+1. reads the store mode and checks it against the configuration;
+2. reuses `runtime_identity_file` when it is non-empty and holds an
+   `AGE-SECRET-KEY-1` line — **no token operation at all**;
+3. otherwise decrypts the master **once**, bounded by `probe_timeout_seconds`:
+   `sops --decrypt --extract '["identity"]' …` with
+   `SOPS_AGE_KEY_FILE=<identity_key_file or key_file>`;
+4. writes the identity atomically to `runtime_identity_file`, mode `0600` below
+   a `0700` directory;
+5. points every item operation at that runtime file;
+6. probe-decrypts one store item; on failure the runtime file is removed, the
+   key file is reset and `AuthFailed` is returned.
+
+`lock` removes the runtime file, resets the effective key file to `key_file`
+and clears the decrypted-document cache.
+
+### Security model
+
+- The derived identity is a **secret on disk** for the length of the session,
+  in `$XDG_RUNTIME_DIR` (a tmpfs, mode `0600`, below a `0700` directory). It is
+  removed on `lock`, which `rosec` runs when the session ends.
+- The trade is explicit: within one unlocked session, a local process that can
+  read the runtime file can read the store without the YubiKey. That is the
+  point of the feature — one touch instead of hundreds — and the runtime file
+  dies with the session.
+- The **master file is safe to sync.** It is ciphertext; only the unlock group
+  can open it. The public sidecar is public by construction.
+- The YubiKey stays the root of trust: it decides whether the master opens.
+- **Losing every unlock key loses the store.** There is no other copy of the
+  derived identity. Keep at least two independent unlock keys; consider a
+  paper recovery key in the master rule.
+- `rewrap` and `rekey` are different tools:
+  - `rewrap` — same derived identity, different unlock keys. Cheap, touches one
+    file.
+  - `rekey` — new derived identity, every item re-encrypted. Expensive, and the
+    only way to revoke the old *derived* identity.
+
+### Runbook: migrate an existing store
+
+```sh
+# 1. Extend the store's .sops.yaml with the master rule (FIRST) and keep the
+#    current item rule for now.
+# 2. Record the mode and create the derived identity.
+rosec-sops --store <store> store init --mode derived
+rosec-sops --store <store> identity init
+# 3. Point the item rule at the printed derived recipient.
+# 4. Re-encrypt the existing items.
+rosec-sops --store <store> identity migrate
+# 5. Set identity_file and age_recipient in the provider options, then unlock.
+```
+
+`migrate` prints how many files it rewrote. A file it could not decrypt is
+listed and left untouched, so a partial migration is visible, not silent.
+
+### Runbook: add or remove an unlock key
+
+```sh
+# 1. ADD the new key to the master rule in .sops.yaml.
+rosec-sops --store <store> identity rewrap
+# 2. verify the new key opens the master on its own host, then
+# 3. REMOVE the old key from the rule and rewrap again.
+rosec-sops --store <store> identity rewrap
+```
+
+Do it in that order. A single rewrap from a rule with no key in common with the
+file fails cleanly and leaves the master untouched, but doing it in one step on
+a rule you also mistyped is how a store gets locked out.
+
+### Runbook: rotate the derived identity (`rekey`)
+
+```sh
+rosec-sops --store <store> identity rekey
+# then: item rule age -> the printed recipient, and the nix module's
+# age_recipient -> the same value.
+```
+
+`rekey` needs the old identity: it uses the valid runtime file when present,
+else the old master through `key_file`. It re-encrypts every item first, then
+writes the new master, sidecar and runtime file. A second `rekey` rotates again.
+
+## Migrating a store
+
+`rosec-sops store migrate --from <src> --to <dst> [--mode direct|derived]` copies
+a store into a new one and is the **only** supported way to change the mode:
+
+```sh
+rosec-sops --store <src> store migrate --from <src> --to <dst> --mode derived
+```
+
+- The destination must be new, or hold nothing but its own store metadata, its
+  master file, its recipient sidecar and `.sops.yaml`; `--force` accepts a
+  populated one (files are then protected by `--overwrite`).
+- `--mode` initialises the destination metadata when it has none; otherwise the
+  destination must already carry a valid mode. A `derived` destination needs
+  `identity init` first.
+- Every item is decrypted with the source key/identity and re-encrypted for the
+  destination, so item ids, collections, labels, timestamps and revisions
+  survive.
+- Conflict archives (`.superseded-*`) and `.conflicts/` markers are **not**
+  copied. A store with an unresolved conflict is refused: resolve it first, or
+  a losing value would either be smuggled along or silently dropped.
+- The source is never modified. Run the daemon against one store at a time.
+
 ## Conflict rule (placeholder)
 
 For one item id, the provider reads the canonical `<id>.sops.yaml` and every
@@ -204,7 +460,7 @@ collection: default
 label: github.com
 winner: default/item-a26e0ed2f8fc642f6b8d078338ca55e0.sops.yaml
 losers:
-- file: default/.superseded-item-a26e0ed2f8fc642f6b8d078338ca55e0.01794687082643598386-oams.sops.yaml
+- file: default/.superseded-item-a26e0ed2f8fc642f6b8d078338ca55e0.01794687082643598386-host-a.sops.yaml
   modified: 2026-11-14T18:30:00Z
   host: otherhost
   revision: 2
@@ -213,13 +469,13 @@ losers:
 winner_meta:
   file: default/item-a26e0ed2f8fc642f6b8d078338ca55e0.sops.yaml
   modified: 2026-11-14T18:00:00Z
-  host: oams
+  host: host-a
   revision: 3
   secrets:
   - password
 written: 2026-11-14T20:00:00Z
 attributes:
-  username: kdn
+  username: user
 hint: Run `rosec-sops conflicts show <item-id>`, then `rosec-sops conflicts resolve <item-id> --keep <winner|loser|file>`.
 ---
 
@@ -400,9 +656,9 @@ writes to the store you name and deletes the item again):
 
 ```sh
 devenv shell -- cargo run -p rosec-sops --example yubikey_smoke -- \
-  ~/Nextcloud/drag0nius@nc.nazarewk.pw/important/rosec-storage \
+  ~/Nextcloud/rosec-store \
   ~/.config/sops/age/keys.txt \
-  age1yubikey1q25g9xpunct74wnn29dgcgep78q666dkhpfg2flltg92fvyrew02j28464d
+  age1yubikey1…
 ```
 
 Add `--dry-run` to use a fresh temporary store instead, so the hardware path can

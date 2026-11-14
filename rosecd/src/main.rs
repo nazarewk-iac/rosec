@@ -2211,7 +2211,17 @@ mod tests {
             enabled: true,
             path: None,
             options,
-            ..serde_json::from_str(r#"{"id": "", "kind": ""}"#).expect("ProviderEntry defaults")
+            allowed_hosts: None,
+            additional_hosts: Vec::new(),
+            return_attr: None,
+            match_attr: None,
+            collection: None,
+            autolock: None,
+            cache_sync_modifier: None,
+            offline_cache: false,
+            tls_mode: rosec_core::config::TlsMode::Bundled,
+            tls_mode_probe: None,
+            unlock_timeout_secs: 0,
         };
 
         let provider = super::build_sops_provider(&entry).expect("sops arm builds the provider");

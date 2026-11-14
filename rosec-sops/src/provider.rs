@@ -19,9 +19,11 @@ use rosec_core::{
 use tracing::{debug, info, warn};
 
 use crate::config::SopsConfig;
-use crate::document::{SopsDocument, Timestamp};
+use crate::document::{DOCUMENT_VERSION, SopsDocument, Timestamp};
 use crate::error::SopsError;
+use crate::identity::runtime_identity_is_valid;
 use crate::store::{COLLECTION_META, Store, StoreCache, StoreItem, validate_name};
+use crate::store_mode::{StoreMode, read_mode};
 
 /// Attribute name carrying the collection of an item.
 pub const ATTR_COLLECTION: &str = "collection";
@@ -255,6 +257,7 @@ impl SopsProvider {
             modified: Some(now),
             host: Some(self.store.host()),
             revision: 1,
+            version: DOCUMENT_VERSION,
         };
         for (name, value) in &item.secrets {
             document.set_secret(name, value.as_slice());
@@ -504,16 +507,22 @@ impl Provider for SopsProvider {
         })
     }
 
-    /// Check the environment, then **prove** the store is readable.
+    /// Check the mode and the environment, then **prove** the store is readable.
     ///
-    /// Three steps, in this order:
+    /// Steps, in this order:
     ///
-    /// 1. the `sops` binary must run and the age identity file must exist;
+    /// 0. the store metadata must name a mode, and the mode must match the
+    ///    configuration (`derived` ⇔ `identity_file`);
+    /// 1. the `sops` binary must run and the age identity file must exist —
+    ///    unless this session already holds the runtime identity, so an
+    ///    unlocked session keeps working with the YubiKey unplugged;
     /// 2. the store root is created when missing;
-    /// 3. one store file is decrypted under a bounded timeout — a collection
+    /// 3. for a `derived` store the master file is unwrapped **once** into the
+    ///    runtime file, and every later item operation uses that file;
+    /// 4. one store file is decrypted under a bounded timeout — a collection
     ///    meta file when present, else the smallest item file.
     ///
-    /// Step 3 is what makes "the YubiKey is the unlock" a verified claim: a
+    /// Step 4 is what makes "the YubiKey is the unlock" a verified claim: a
     /// token in the wrong slot, a revoked recipient, or a `keys.txt` holding
     /// another identity fails here with [`ProviderError::AuthFailed`] instead of
     /// unlocking and failing on every read with a generic fault. A store with no
@@ -524,16 +533,51 @@ impl Provider for SopsProvider {
             return Ok(());
         }
 
-        let version = self.store.sops().probe().await.map_err(|e| {
+        let mode = read_mode(&self.config.path).map_err(SopsError::into_provider_error)?;
+        if let Err(e) = self.config.check_mode(mode) {
+            warn!(provider_id = %self.id, error = %e, "sops provider refuses to unlock");
+            return Err(e);
+        }
+
+        // The runtime identity makes the token optional: an unlocked session
+        // must survive the YubiKey being unplugged.
+        let runtime = self.config.runtime_identity_file.clone();
+        let runtime_ready = mode == StoreMode::Derived && runtime_identity_is_valid(&runtime);
+        let probe_key_file = if runtime_ready {
+            None
+        } else {
+            Some(self.config.key_file.as_path())
+        };
+        let version = self.store.sops().probe(probe_key_file).await.map_err(|e| {
             warn!(provider_id = %self.id, error = %e, "sops provider cannot unlock");
             e.into_provider_error()
         })?;
-        debug!(sops = %version, key_file = %self.store.sops().key_file().display(), "sops available");
+        debug!(
+            sops = %version,
+            key_file = %self.config.key_file.display(),
+            mode = %mode,
+            "sops available",
+        );
 
         self.store
             .ensure_root()
             .await
             .map_err(SopsError::into_provider_error)?;
+
+        // Unlock once: the derived identity lands in the runtime file, and
+        // every item operation then costs no token operation.
+        let mut unwrapped = false;
+        if mode == StoreMode::Derived {
+            unwrapped = match crate::identity::ensure_runtime_identity(&self.config).await {
+                Ok(unwrapped) => unwrapped,
+                Err(e) => {
+                    warn!(provider_id = %self.id, error = %e, "cannot unwrap the store identity");
+                    return Err(e.into_provider_error());
+                }
+            };
+            self.store.sops().set_key_file(runtime.clone());
+            debug!(runtime = %runtime.display(), unwrapped, "derived identity in use");
+        }
 
         let mut counts: Vec<(String, usize)> = Vec::new();
         for collection in self
@@ -587,6 +631,12 @@ impl Provider for SopsProvider {
                         timeout = ?timeout,
                         "unlock probe failed: the identity cannot read this store",
                     );
+                    // A runtime file that was just written must not survive a
+                    // failed probe: the next unlock must unwrap again.
+                    if mode == StoreMode::Derived && unwrapped {
+                        crate::identity::remove_runtime_identity(&runtime);
+                        self.store.sops().set_key_file(self.config.key_file.clone());
+                    }
                     return Err(provider_error);
                 }
             }
@@ -608,6 +658,7 @@ impl Provider for SopsProvider {
         info!(
             provider_id = %self.id,
             root = %self.config.path.display(),
+            mode = %mode,
             default_collection = ?default,
             "sops provider unlocked",
         );
@@ -624,6 +675,14 @@ impl Provider for SopsProvider {
             .default_collection
             .write()
             .unwrap_or_else(|e| e.into_inner()) = None;
+
+        // A locked session must not keep the unwrapped identity: the runtime
+        // file is the secret, and the effective identity goes back to the
+        // configured `key_file` so a later read cannot slip through.
+        if self.config.identity_file.is_some() {
+            crate::identity::remove_runtime_identity(&self.config.runtime_identity_file);
+            self.store.sops().set_key_file(self.config.key_file.clone());
+        }
 
         let callbacks = self
             .callbacks

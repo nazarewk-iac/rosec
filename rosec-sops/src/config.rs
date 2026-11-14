@@ -1,5 +1,7 @@
 //! Provider configuration: the `path`, `key_file`, `age_recipient` and
-//! `sops_binary` options of a `kind = "sops"` provider entry.
+//! `sops_binary` options of a `kind = "sops"` provider entry, plus the
+//! unlock-once options `identity_file`, `identity_key_file` and
+//! `runtime_identity_file`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -8,6 +10,7 @@ use std::time::Duration;
 use rosec_core::ProviderError;
 
 use crate::error::SopsError;
+use crate::store_mode::StoreMode;
 
 /// Default path of the sops age identity file, relative to `$HOME`.
 ///
@@ -26,7 +29,7 @@ pub const DEFAULT_SOPS_BINARY: &str = "sops";
 /// [[provider]]
 /// id   = "sops"
 /// kind = "sops"
-/// path = "~/Nextcloud/drag0nius@nc.nazarewk.pw/important/rosec-storage"
+/// path = "~/Nextcloud/rosec-store"
 ///
 /// [provider.options]
 /// key_file      = "~/.config/sops/age/keys.txt"
@@ -69,6 +72,23 @@ pub struct SopsConfig {
     /// YubiKey in the wrong slot fails at unlock instead of on the first read.
     /// The probe is bounded so an unplugged token cannot hang `rosec unlock`.
     pub probe_timeout: Duration,
+    /// The sops-encrypted master file that holds the derived sops identity
+    /// (`<store>/.rosec-store-identity.sops.yaml`).
+    ///
+    /// `None` means the `direct` store mode: `key_file` is the identity of
+    /// every item operation, exactly as before. `Some` means the `derived`
+    /// store mode: the master is unwrapped once per session and the derived
+    /// identity does the item work.
+    pub identity_file: Option<PathBuf>,
+    /// The identity used **only** to decrypt the master file.
+    ///
+    /// `None` falls back to `key_file`. The recipients of the master file are
+    /// chosen by the store's own `.sops.yaml` rule, so that rule — not this
+    /// option — decides whether an age, PGP or KMS key is needed.
+    pub identity_key_file: Option<PathBuf>,
+    /// Where `unlock` caches the unwrapped derived identity for this session,
+    /// with mode 0600 below a 0700 directory.
+    pub runtime_identity_file: PathBuf,
 }
 
 impl SopsConfig {
@@ -111,6 +131,17 @@ impl SopsConfig {
             }
             config.probe_timeout = Duration::from_secs(seconds);
         }
+        config.identity_file = match string_option(options, "identity_file") {
+            Some(raw) => Some(expand_home(&raw)?),
+            None => None,
+        };
+        config.identity_key_file = match string_option(options, "identity_key_file") {
+            Some(raw) => Some(expand_home(&raw)?),
+            None => None,
+        };
+        if let Some(raw) = string_option(options, "runtime_identity_file") {
+            config.runtime_identity_file = expand_home(&raw)?;
+        }
         Ok(config)
     }
 
@@ -147,7 +178,99 @@ impl SopsConfig {
             age_recipient,
             sops_binary,
             probe_timeout: crate::sops::DEFAULT_PROBE_TIMEOUT,
+            identity_file: None,
+            identity_key_file: None,
+            runtime_identity_file: default_runtime_identity_file(),
         })
+    }
+
+    /// The store mode these options describe.
+    ///
+    /// `identity_file` is the only switch: `Some` means `derived`, `None` means
+    /// `direct`. The store's own metadata must agree — see
+    /// [`SopsConfig::check_mode`].
+    pub fn mode(&self) -> StoreMode {
+        match self.identity_file {
+            Some(_) => StoreMode::Derived,
+            None => StoreMode::Direct,
+        }
+    }
+
+    /// The identity file that decrypts the master file.
+    ///
+    /// `identity_key_file` when set, else `key_file` (the local unlock
+    /// identity).
+    pub fn master_key_file(&self) -> &Path {
+        self.identity_key_file.as_deref().unwrap_or(&self.key_file)
+    }
+
+    /// Refuse a configuration that disagrees with the store metadata.
+    ///
+    /// The mode is recorded in `<store>/.rosec-store.yaml` and never changes
+    /// in place, so a mismatch is a configuration error, not something to
+    /// guess around: a `derived` store read through a `direct` entry would
+    /// write item files that the derived identity cannot open.
+    pub fn check_mode(&self, mode: StoreMode) -> Result<(), ProviderError> {
+        match (mode, self.identity_file.is_some()) {
+            (StoreMode::Direct, false) | (StoreMode::Derived, true) => Ok(()),
+            (StoreMode::Direct, true) => Err(SopsError::Config(format!(
+                "`{}` is a `direct` store but this provider sets `identity_file`; remove \
+                 `identity_file` (or migrate the store: `rosec-sops store migrate`)",
+                self.path.display()
+            ))
+            .into_provider_error()),
+            (StoreMode::Derived, false) => Err(SopsError::Config(format!(
+                "`{}` is a `derived` store but this provider has no `identity_file`; set it to \
+                 `{}/{}`",
+                self.path.display(),
+                self.path.display(),
+                crate::store_mode::STORE_IDENTITY_FILE
+            ))
+            .into_provider_error()),
+        }
+    }
+}
+
+/// The master file inside a store root.
+pub fn store_identity_path(store: &Path) -> PathBuf {
+    store.join(crate::store_mode::STORE_IDENTITY_FILE)
+}
+
+/// The plaintext sidecar holding the derived **public** recipient.
+pub fn store_identity_recipient_path(store: &Path) -> PathBuf {
+    store.join(crate::store_mode::STORE_IDENTITY_RECIPIENT_FILE)
+}
+
+/// The runtime file a session keeps the unwrapped derived identity in.
+///
+/// `$XDG_RUNTIME_DIR/rosec/store-identity.age`, else
+/// `/tmp/rosec-<uid>/store-identity.age` when `XDG_RUNTIME_DIR` is unset.
+pub fn default_runtime_identity_file() -> PathBuf {
+    let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("rosec"),
+        _ => PathBuf::from(format!(
+            "/tmp/rosec-{}",
+            // `id -u` without a dependency: the effective uid via `std`.
+            effective_uid()
+        )),
+    };
+    dir.join("store-identity.age")
+}
+
+/// Effective user id, used only for the `/tmp` fallback path.
+fn effective_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // `/proc/self` is owned by the effective uid on Linux.
+        if let Ok(meta) = std::fs::metadata("/proc/self") {
+            return meta.uid();
+        }
+        0
+    }
+    #[cfg(not(unix))]
+    {
+        0
     }
 }
 
@@ -270,7 +393,7 @@ mod tests {
         assert!(validate_recipient("ssh-ed25519 AAAAC3Nza").is_err());
         assert!(
             validate_recipient(
-                "age1yubikey1q25g9xpunct74wnn29dgcgep78q666dkhpfg2flltg92fvyrew02j28464d"
+                "age1yubikey1qtestrecipient0000000000000000000000000000000000000000000"
             )
             .is_ok()
         );
@@ -298,7 +421,7 @@ mod tests {
         options.insert(
             "age_recipient".into(),
             serde_json::json!(
-                "age1yubikey1q25g9xpunct74wnn29dgcgep78q666dkhpfg2flltg92fvyrew02j28464d"
+                "age1yubikey1qtestrecipient0000000000000000000000000000000000000000000"
             ),
         );
         let cfg = SopsConfig::from_options(None, &options).unwrap();
@@ -322,7 +445,7 @@ mod tests {
         options.insert(
             "age_recipient".into(),
             serde_json::json!(
-                "age1yubikey1q25g9xpunct74wnn29dgcgep78q666dkhpfg2flltg92fvyrew02j28464d"
+                "age1yubikey1qtestrecipient0000000000000000000000000000000000000000000"
             ),
         );
         let cfg = SopsConfig::from_options(Some("/srv/store"), &options).unwrap();

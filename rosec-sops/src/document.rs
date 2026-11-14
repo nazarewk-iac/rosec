@@ -7,15 +7,16 @@
 //! label: github.com
 //! attributes:
 //!   rosec:type: login
-//!   username: kdn
+//!   username: user
 //! secrets:
 //!   password: hunter2
 //! binary_secrets:
 //!   blob: aGVsbG8=
 //! created: 2026-11-14T18:02:11Z
 //! modified: 2026-11-14T18:41:09.417Z
-//! host: oams
+//! host: host-a
 //! revision: 7
+//! version: 1
 //! ```
 //!
 //! `secrets` holds UTF-8 text and keeps the file readable and greppable after
@@ -36,6 +37,13 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
 use crate::error::SopsError;
+
+/// Schema version of an item document.
+///
+/// A missing `version` field means version 1, so every file written before the
+/// field existed still reads. A document from a newer writer is refused on read
+/// instead of being silently rewritten without its newer fields.
+pub const DOCUMENT_VERSION: u32 = 1;
 
 /// One item, as stored in a single sops file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,6 +71,14 @@ pub struct SopsDocument {
     /// Monotonic revision counter, incremented on every write.
     #[serde(default)]
     pub revision: u64,
+    /// Schema version. Missing means version 1; a zero or newer version is refused on read.
+    #[serde(default = "document_version")]
+    pub version: u32,
+}
+
+/// Serde default for a document written before the `version` field existed.
+fn document_version() -> u32 {
+    DOCUMENT_VERSION
 }
 
 /// Decode error for a stored secret value.
@@ -148,10 +164,20 @@ impl SopsDocument {
 
     /// Parse decrypted plaintext.
     pub fn from_yaml(bytes: &[u8], path: &str) -> Result<Self, SopsError> {
-        serde_yaml::from_slice(bytes).map_err(|e| SopsError::Malformed {
+        let document: Self = serde_yaml::from_slice(bytes).map_err(|e| SopsError::Malformed {
             path: path.to_owned(),
             reason: e.to_string(),
-        })
+        })?;
+        if document.version == 0 || document.version > DOCUMENT_VERSION {
+            return Err(SopsError::Malformed {
+                path: path.to_owned(),
+                reason: format!(
+                    "document version {} is not supported (this build supports 1..={DOCUMENT_VERSION})",
+                    document.version
+                ),
+            });
+        }
+        Ok(document)
     }
 
     /// Sort key for the conflict rule: `modified` (missing = epoch), then the
@@ -261,13 +287,14 @@ mod tests {
     fn sample() -> SopsDocument {
         SopsDocument {
             label: "github.com".into(),
-            attributes: BTreeMap::from([("username".to_string(), "kdn".to_string())]),
+            attributes: BTreeMap::from([("username".to_string(), "user".to_string())]),
             secrets: BTreeMap::from([("password".to_string(), "hunter2".to_string())]),
             binary_secrets: BTreeMap::new(),
             created: Some(Timestamp(UNIX_EPOCH + Duration::from_secs(1_700_000_000))),
             modified: Some(Timestamp(UNIX_EPOCH + Duration::from_secs(1_700_000_100))),
-            host: Some("oams".into()),
+            host: Some("host-a".into()),
             revision: 3,
+            version: DOCUMENT_VERSION,
         }
     }
 
@@ -277,12 +304,35 @@ mod tests {
         let yaml = doc.to_yaml().unwrap();
         assert!(yaml.contains("password: hunter2"), "{yaml}");
         assert!(yaml.contains("modified: 2023-11-14T"), "{yaml}");
+        assert!(yaml.contains("version: 1"), "{yaml}");
         assert!(
             !yaml.contains("binary_secrets"),
             "empty binary map must not be written: {yaml}"
         );
         let back = SopsDocument::from_yaml(yaml.as_bytes(), "<test>").unwrap();
         assert_eq!(back, doc);
+    }
+
+    #[test]
+    fn missing_version_defaults_to_one() {
+        let doc = SopsDocument::from_yaml(b"label: x\n", "<t>").unwrap();
+        assert_eq!(doc.version, DOCUMENT_VERSION);
+    }
+
+    #[test]
+    fn refuses_a_newer_document_version() {
+        let error = SopsDocument::from_yaml(b"label: x\nversion: 2\n", "<t>").unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("version 2"), "{text}");
+        assert!(text.contains("not supported"), "{text}");
+    }
+
+    #[test]
+    fn refuses_version_zero() {
+        let error = SopsDocument::from_yaml(b"label: x\nversion: 0\n", "<t>").unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("version 0"), "{text}");
+        assert!(text.contains("not supported"), "{text}");
     }
 
     #[test]
