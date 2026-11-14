@@ -40,6 +40,11 @@
 
           src = self;
 
+          # The three RustCrypto/SSH crates share one git rev; `cargoLock` keys
+          # the map by `name-version`, so the same tree hash appears once per
+          # crate. Keep one variable so a rev bump updates all three together.
+          rustCryptoSshHash = "sha256-QxERWdCppY/bwpYvTtweQFEC8TtYhlFqypIKnaDy79I=";
+
           rosecPam = stdenv.mkDerivation {
             pname = "pam_rosec";
             inherit version src;
@@ -73,9 +78,9 @@
             cargoLock = {
               lockFile = ./Cargo.lock;
               outputHashes = {
-                "ssh-cipher-0.2.0" = "sha256-QxERWdCppY/bwpYvTtweQFEC8TtYhlFqypIKnaDy79I=";
-                "ssh-encoding-0.2.0" = "sha256-QxERWdCppY/bwpYvTtweQFEC8TtYhlFqypIKnaDy79I=";
-                "ssh-key-0.6.7" = "sha256-QxERWdCppY/bwpYvTtweQFEC8TtYhlFqypIKnaDy79I=";
+                "ssh-cipher-0.2.0" = rustCryptoSshHash;
+                "ssh-encoding-0.2.0" = rustCryptoSshHash;
+                "ssh-key-0.6.7" = rustCryptoSshHash;
               };
             };
 
