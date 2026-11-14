@@ -11,6 +11,7 @@ rosec-events = { path = "../rosec-events" }
 anyhow = { workspace = true }
 rosec-core = { path = "../rosec-core" }
 rosec-vault = { path = "../rosec-vault" }
+rosec-sops = { path = "../rosec-sops" }
 rosec-wasm = { path = "../rosec-wasm" }
 rosec-secret-service = { path = "../rosec-secret-service" }
 rosec-ssh-agent = { path = "../rosec-ssh-agent" }

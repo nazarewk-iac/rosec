@@ -1337,6 +1337,28 @@ async fn build_providers(
                 );
                 providers.push(provider);
             }
+            "sops" => {
+                // A malformed `sops` entry is a configuration error, not an
+                // unknown kind: report it and skip only this provider so the
+                // rest of the daemon still starts.
+                match build_sops_provider(entry) {
+                    Ok(provider) => {
+                        tracing::info!(
+                            provider_id = %entry.id,
+                            path = %entry.path.as_deref().unwrap_or(""),
+                            "sops store initialized"
+                        );
+                        providers.push(provider);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            provider_id = %entry.id,
+                            error = %e,
+                            "invalid sops provider config; skipping"
+                        );
+                    }
+                }
+            }
             _ => match build_single_provider(entry, plugin_registry).await {
                 Ok(provider) => {
                     tracing::info!(
@@ -1373,6 +1395,20 @@ async fn build_providers(
 fn build_vault_provider(entry: &rosec_core::config::ProviderEntry) -> Arc<dyn Provider> {
     let path = rosec_core::config::resolve_vault_path(entry.path.as_deref().unwrap_or(""));
     Arc::new(rosec_vault::LocalVault::new(&entry.id, path))
+}
+
+/// Construct a sops file-tree provider from a `[[provider]]` entry with
+/// `kind = "sops"`.
+///
+/// Options: `path` (store root, also accepted from `provider.path`),
+/// `key_file` (default `~/.config/sops/age/keys.txt`), `age_recipient`
+/// (required, the YubiKey age recipient) and `sops_binary` (default `sops`).
+fn build_sops_provider(
+    entry: &rosec_core::config::ProviderEntry,
+) -> Result<Arc<dyn Provider>, rosec_core::ProviderError> {
+    let provider =
+        rosec_sops::SopsProvider::from_entry(&entry.id, entry.path.as_deref(), &entry.options)?;
+    Ok(Arc::new(provider))
 }
 
 /// Compute a stable fingerprint string for a provider config entry.
@@ -1682,6 +1718,25 @@ async fn reconcile_providers(
                 tracing::info!(vault_id = id, "hot-reload: added vault");
                 true
             }
+            "sops" => match build_sops_provider(entry) {
+                Ok(provider) => {
+                    state.hotreload_add_provider(provider);
+                    tracing::info!(
+                        provider_id = id,
+                        path = %entry.path.as_deref().unwrap_or(""),
+                        "hot-reload: added sops store"
+                    );
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        provider_id = id,
+                        error = %e,
+                        "hot-reload: invalid sops provider config"
+                    );
+                    false
+                }
+            },
             _ => match build_single_provider(entry, plugin_registry).await {
                 Ok(provider) => {
                     state.hotreload_add_provider(provider);
@@ -2139,6 +2194,49 @@ mod tests {
     fn extract_host_garbage_returns_none() {
         assert_eq!(extract_host_from_url("not-a-url"), None);
     }
+
+    /// `kind = "sops"` must build on the hot-reload path, not only at startup.
+    /// `build_single_provider` rejects it as an unknown kind, so a reloaded sops
+    /// provider used to be warning-logged and dropped until a restart.
+    #[tokio::test]
+    async fn sops_provider_builds_on_the_hot_reload_path() {
+        let mut options = std::collections::HashMap::new();
+        options.insert(
+            "path".to_string(),
+            serde_json::Value::String("/nonexistent/rosec-test-store".into()),
+        );
+        let entry = rosec_core::config::ProviderEntry {
+            id: "sops-test".into(),
+            kind: "sops".into(),
+            enabled: true,
+            path: None,
+            options,
+            ..serde_json::from_str(r#"{"id": "", "kind": ""}"#).expect("ProviderEntry defaults")
+        };
+
+        let provider = super::build_sops_provider(&entry).expect("sops arm builds the provider");
+        assert_eq!(provider.id(), "sops-test");
+
+        // The regression itself: the generic path must still not claim this kind.
+        let registry = rosec_wasm::PluginRegistry::default();
+        let err = match super::build_single_provider(&entry, &registry).await {
+            Ok(_) => panic!("the generic path must not handle sops"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("unknown provider kind"),
+            "unexpected error: {err}"
+        );
+
+        // An unusable config must fail, so the reload arm logs and skips instead
+        // of registering a broken store.
+        let broken = rosec_core::config::ProviderEntry {
+            options: std::collections::HashMap::new(),
+            ..entry
+        };
+        assert!(super::build_sops_provider(&broken).is_err());
+    }
+
     #[test]
     fn fragment_atomic_replacement_notifies_daemon() {
         use notify::Watcher;
