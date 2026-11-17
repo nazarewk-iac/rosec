@@ -289,30 +289,59 @@ async fn create_with_replace_updates_the_existing_item() {
     let provider = fixture.provider();
     unlock(&provider).await;
 
-    let first = provider
-        .create_item(new_item("token", &[("secret", "abc")]), false)
-        .await
-        .unwrap();
+    let mut token = new_item("token", &[("secret", "abc")]);
+    token.attributes.insert("service".into(), "token".into());
+    let first = provider.create_item(token.clone(), false).await.unwrap();
     assert!(matches!(
-        provider
-            .create_item(new_item("token", &[("secret", "abc")]), false)
-            .await,
+        provider.create_item(token, false).await,
         Err(ProviderError::AlreadyExists)
     ));
-    let second = provider
-        .create_item(new_item("token renamed", &[("secret", "abc")]), true)
-        .await
-        .unwrap();
+    let mut renamed = new_item("token renamed", &[("secret", "abc")]);
+    renamed.attributes.insert("service".into(), "token".into());
+    let second = provider.create_item(renamed, true).await.unwrap();
     assert_eq!(first, second, "replace must hit the same file");
     assert_eq!(provider.list_items().await.unwrap().len(), 1);
 
     // Different secrets under the same label are a separate item, not an
     // update.
-    let other = provider
-        .create_item(new_item("token", &[("secret", "different")]), true)
+    let mut rotated = new_item("token", &[("secret", "different")]);
+    rotated.attributes.insert("service".into(), "token".into());
+    let other = provider.create_item(rotated, true).await.unwrap();
+    assert_eq!(first, other, "a rotated secret must replace in place");
+    assert_eq!(provider.list_items().await.unwrap().len(), 1);
+    assert_eq!(
+        provider
+            .get_secret_value(&first, "secret")
+            .await
+            .unwrap()
+            .bytes
+            .as_slice(),
+        b"different"
+    );
+}
+
+#[tokio::test]
+async fn label_matched_items_keep_the_content_check() {
+    if !has_tools() {
+        eprintln!("SKIP: sops or age-keygen missing");
+        return;
+    }
+    let fixture = Fixture::new();
+    let provider = fixture.provider();
+    unlock(&provider).await;
+
+    // No client attributes: the label is only a heuristic identity (a CLI convenience, not the
+    // Secret Service contract), so two different notes that happen to share a label must stay
+    // separate even with replace set.
+    let first = provider
+        .create_item(new_item("note", &[("secret", "one")]), false)
         .await
         .unwrap();
-    assert_ne!(first, other, "different secrets must not merge");
+    let second = provider
+        .create_item(new_item("note", &[("secret", "two")]), true)
+        .await
+        .unwrap();
+    assert_ne!(first, second);
     assert_eq!(provider.list_items().await.unwrap().len(), 2);
 }
 

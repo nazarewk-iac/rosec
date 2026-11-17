@@ -792,20 +792,25 @@ impl Provider for SopsProvider {
         Ok(SecretValue::text(SecretBytes::new(bytes)))
     }
 
-    /// Create an item, or update the item that already holds the same secrets.
+    /// Create an item, or replace the item with the same attributes.
     ///
     /// The id is **random** (`item-<64 hex chars>`), never derived from the
     /// secret. A derived id would be an offline verifier — the store is
     /// plaintext-synced, so any observer could confirm a guess of a
     /// low-entropy secret by hashing it — and it would change on every write.
     ///
-    /// Matching an existing item therefore follows identity, not content: an
-    /// item with client attributes matches by attribute subset, an item
-    /// without attributes matches by label. A match is an update when
-    /// `replace` is set and [`ProviderError::AlreadyExists`] otherwise, which is
-    /// what makes two hosts that write the same `key=value` converge on one
-    /// file. Only candidates whose identity matches are decrypted, so a create
-    /// does not cost one YubiKey operation per item in the store.
+    /// Matching follows identity, not content: an item with client attributes
+    /// matches by attribute subset, an item without attributes matches by
+    /// label. This is what the Secret Service contract and KeePassXC's
+    /// FdoSecrets do: `CreateItem(replace=true)` replaces an item "with the
+    /// same attributes", and the incoming secret is the *new* value, so a
+    /// rotated secret must replace in place and keep its id. Comparing secrets
+    /// first would mint a second item exactly when a client rotates one.
+    ///
+    /// A match is a replacement when `replace` is set and
+    /// [`ProviderError::AlreadyExists`] otherwise. Only candidates whose
+    /// identity matches are decrypted, so a create does not cost one YubiKey
+    /// operation per item in the store.
     async fn create_item(&self, item: NewItem, replace: bool) -> Result<String, ProviderError> {
         self.ensure_unlocked()?;
         item.validate()?;
@@ -818,6 +823,12 @@ impl Provider for SopsProvider {
             );
         }
 
+        // The client-supplied attributes are the identity. `document.attributes` also carries the
+        // provider-stamped `rosec:type`, so it can never express "the client gave no attributes".
+        let identity: std::collections::BTreeMap<String, String> = attributes
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let document = self.document_from_new(&item, attributes);
         // A binary-only item has an empty text map, so both maps count.
         if document.secret_names().next().is_none() {
@@ -835,11 +846,11 @@ impl Provider for SopsProvider {
         {
             // Identity first: a cheap filename/attribute guess filters the list
             // before anything is decrypted.
-            let matches = if document.attributes.is_empty() {
+            let matches = if identity.is_empty() {
                 self.label_matches(&collection, &candidate, &document.label)
                     .await?
             } else {
-                self.attributes_match(&collection, &candidate, &document.attributes)
+                self.attributes_match(&collection, &candidate, &identity)
                     .await?
             };
             if !matches {
@@ -848,7 +859,11 @@ impl Provider for SopsProvider {
             let Ok(existing) = self.store.resolve_item(&collection, &candidate).await else {
                 continue;
             };
-            if !existing.document.secrets_equal(&document) {
+            // A label is a heuristic identity for an item that carries no client attributes
+            // (a CLI convenience, not part of the Secret Service contract), so it keeps the
+            // content check. An attribute match follows the contract: replace regardless of the
+            // secret, because the incoming secret is the new value.
+            if identity.is_empty() && !existing.document.secrets_equal(&document) {
                 continue;
             }
             if !replace {
@@ -857,6 +872,14 @@ impl Provider for SopsProvider {
             let mut merged = existing.document.clone();
             merged.label = document.label.clone();
             merged.attributes = document.attributes.clone();
+            // The incoming secret is the new value: replace each name it carries and keep any
+            // secret the client did not mention (a client that writes only `password` must not
+            // drop a stored `notes`).
+            for name in document.secret_names() {
+                if let Some(Ok(value)) = document.secret_bytes(name) {
+                    merged.set_secret(name, &value);
+                }
+            }
             merged.revision = merged.revision.saturating_add(1);
             merged.modified = Some(Timestamp::now());
             merged.host = Some(self.store.host());
